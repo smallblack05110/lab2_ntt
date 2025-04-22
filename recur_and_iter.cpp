@@ -111,8 +111,8 @@ void ntt_recur(vector<int> &a, int p, int root, bool invert) {  //ntt递归实�
 void ntt_iter(vector<int>& a, int p, int root, bool invert) {  //ntt迭代实现
     int n = a.size();
     int half = n / 2;
-    int bit = half;
-    for (int i = 1, j = 0; i < n; i++) {    //将顺序交换，偶数一起，奇数一起
+    for (int i = 1, j = 0; i < n; i++) { 
+         int bit = half;
         for (; j >= bit; bit /= 2) {
             j -= bit;
         }
