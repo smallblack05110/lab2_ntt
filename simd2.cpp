@@ -12,93 +12,89 @@
 #include <arm_neon.h> // 使用 NEON 加速
 using namespace std;
 
-// 扩展欧几里得算法求解 a*x + b*y = gcd(a, b)，返回 (g, x, y)
-static std::tuple<long long, long long, long long> egcd(long long a, long long b)
-{
-  if (a == 0)
-    return std::make_tuple(b, 0LL, 1LL);
-  auto result = egcd(b % a, a);
-  long long g = std::get<0>(result);
-  long long x = std::get<1>(result);
-  long long y = std::get<2>(result);
-  // 更新 x, y 对应原始 a, b
-  return std::make_tuple(g, y - (b / a) * x, x);
-}
-
 class MontMul
 {
 public:
-  MontMul(long long R, long long N)
+  // 构造函数要求 R 为 2 的幂
+  MontMul(uint64_t R, uint64_t N) : R(R), N(N)
   {
-    this->N = N;
-    this->R = R;
-    this->logR = static_cast<int>(log2(R));
-    // 计算 N_inv，使得 N * N_inv ≡ 1 (mod R)
-    long long N_inv = std::get<1>(egcd(N, R));
-    if (N_inv < 0)
+    if (R == 0 || (R & (R - 1)) != 0)
     {
-      N_inv += R;
+      throw std::invalid_argument("R must be a power of two");
     }
-    this->N_inv_neg = R - N_inv;
-    // R2 = R * R mod N
-    long long R_modN = R % N;
-    this->R2 = (R_modN * R_modN) % N;
-  }
-
-  // 蒙哥马利约减：计算 (T + m * N) / R mod N，其中 m = (T * N_inv_neg) mod R
-  long long REDC(long long T) const
-  {
-    // mask = R - 1
-    long long mask = (logR == 64 ? -1LL : ((1LL << logR) - 1));
-    long long m = ((T & mask) * N_inv_neg) & mask;
-    long long t = (T + m * N) >> logR;
-    if (t >= N)
+    logR = static_cast<int>(std::log2(R));
+    if ((1ULL << logR) != R)
     {
-      t -= N;
+      throw std::invalid_argument("R is not a power of two");
     }
-    return t;
+    uint64_t N_inv = modinv(N, R);
+    N_inv_neg = R - N_inv;
+    __int128 R_squared = static_cast<__int128>(R) * R;
+    R2 = static_cast<uint64_t>(R_squared % N);
   }
 
-  // 转换到蒙哥马利表述（a -> a * R mod N）
-  long long toMont(long long a) const
+  // REDC 算法，将 __int128 类型的 T 转换为 Montgomery 域内元素
+  uint64_t REDC(__int128 T) const
   {
-    // 乘以 R^2 后简化，得到 a 的蒙哥马利表示
-    long long T = (long long)((__int128)a * R2 % N);
-    return REDC(T);
+    uint64_t mask = (logR == 64) ? ~0ULL : ((1ULL << logR) - 1);
+    uint64_t m_part = static_cast<uint64_t>(T) & mask;
+    uint64_t m = (m_part * N_inv_neg) & mask;
+    __int128 mN = static_cast<__int128>(m) * N;
+    __int128 t_val = (T + mN) >> logR;
+    uint64_t t = static_cast<uint64_t>(t_val);
+    return t >= N ? t - N : t;
   }
 
-  // 从蒙哥马利表示还原普通值
-  long long fromMont(long long aR) const
+  // 将普通整数转换到 Montgomery 域
+  uint64_t toMont(uint64_t a) const
+  {
+    return REDC(static_cast<__int128>(a) * R2);
+  }
+
+  // 从 Montgomery 域转换回普通整数
+  uint64_t fromMont(uint64_t aR) const
   {
     return REDC(aR);
   }
 
-  // 蒙哥马利模乘：相乘两个蒙哥马利表示数
-  long long mulMont(long long aR, long long bR) const
+  // 在 Montgomery 域内进行乘法运算
+  uint64_t mulMont(uint64_t aR, uint64_t bR) const
   {
-    long long T = (long long)((__int128)aR * bR);
-    return REDC(T);
+    return REDC(static_cast<__int128>(aR) * bR);
   }
 
-  // 批量转换 vector 到蒙哥马利域
+  // 保持原有接口：对于 a, b（要求均小于模 N），返回 a * b mod N
+  uint64_t ModMul(uint64_t a, uint64_t b)
+  {
+    if (a >= N || b >= N)
+    {
+      throw std::invalid_argument("input must be smaller than modulus N");
+    }
+    uint64_t aR = toMont(a);
+    uint64_t bR = toMont(b);
+    uint64_t abR = mulMont(aR, bR);
+    return fromMont(abR);
+  }
+
+  // 批量将 vector 中的元素转换到 Montgomery 域
   void toMontVec(vector<long long> &inout) const
   {
 #pragma omp parallel for
-    for (int i = 0; i < (int)inout.size(); ++i)
+    for (size_t i = 0; i < inout.size(); ++i)
     {
-      __int128 prod = (__int128)inout[i] * R2;
-      long long T = (long long)(prod % N);
-      inout[i] = REDC(T);
+      uint64_t val = static_cast<uint64_t>(inout[i]);
+      inout[i] = static_cast<long long>(toMont(val));
     }
   }
 
-  // 批量从蒙哥马利域转换 vector
+  // 批量将 Montgomery 域内的元素转换回普通整数
   void fromMontVec(vector<long long> &inout) const
   {
 #pragma omp parallel for
-    for (int i = 0; i < (int)inout.size(); ++i)
+    for (size_t i = 0; i < inout.size(); ++i)
     {
-      inout[i] = REDC(inout[i]);
+      uint64_t val = static_cast<uint64_t>(inout[i]);
+      inout[i] = static_cast<long long>(fromMont(val));
     }
   }
 
@@ -151,11 +147,57 @@ public:
   }
 
 private:
-  long long N;
-  long long R;
-  long long N_inv_neg;
-  long long R2;
+  uint64_t N;
+  uint64_t R;
   int logR;
+  uint64_t N_inv_neg;
+  uint64_t R2;
+
+  struct EgcdResult
+  {
+    int64_t g;
+    int64_t x;
+    int64_t y;
+  };
+
+  // 扩展欧几里得算法（适用于无符号数，但 x, y 为带符号类型）
+  static EgcdResult egcd(uint64_t a, uint64_t b)
+  {
+    uint64_t old_r = a, r = b;
+    int64_t old_s = 1, s = 0;
+    int64_t old_t = 0, t = 1;
+    while (r != 0)
+    {
+      uint64_t quotient = old_r / r;
+      uint64_t temp = old_r;
+      old_r = r;
+      r = temp - quotient * r;
+
+      int64_t temp_s = old_s;
+      old_s = s;
+      s = temp_s - static_cast<int64_t>(quotient) * s;
+
+      int64_t temp_t = old_t;
+      old_t = t;
+      t = temp_t - static_cast<int64_t>(quotient) * t;
+    }
+    return {static_cast<int64_t>(old_r), old_s, old_t};
+  }
+
+  static uint64_t modinv(uint64_t a, uint64_t m)
+  {
+    auto result = egcd(a, m);
+    if (result.g != 1)
+    {
+      throw std::runtime_error("modular inverse does not exist");
+    }
+    int64_t x = result.x % static_cast<int64_t>(m);
+    if (x < 0)
+    {
+      x += m;
+    }
+    return static_cast<uint64_t>(x);
+  }
 };
 
 // 快速幂取模
@@ -175,74 +217,86 @@ int quick_mod(int a, int b, int p)
   return (int)result;
 }
 
-
-  void ntt_iter(vector<long long> &a, int p, int root, bool invert, const MontMul &mont) {
-    int n = a.size();
-    // 位逆序重排
-    for (int i = 1, j = 0; i < n; ++i) {
-      int bit = n >> 1;
-      for (; j & bit; bit >>= 1) {
-        j ^= bit;
-      }
-      j |= bit;
-      if (i < j) {
-        swap(a[i], a[j]);
+void ntt_iter(vector<long long> &a, int p, int root, bool invert, const MontMul &mont)
+{
+  int n = a.size();
+  // 位逆序重排
+  for (int i = 1, j = 0; i < n; ++i)
+  {
+    int bit = n >> 1;
+    for (; j & bit; bit >>= 1)
+    {
+      j ^= bit;
+    }
+    j |= bit;
+    if (i < j)
+    {
+      swap(a[i], a[j]);
+    }
+  }
+  // 按长度迭代合并 (蝶形变换)
+  for (int len = 2; len <= n; len <<= 1)
+  {
+    int wn = quick_mod(root, (p - 1) / len, p);
+    if (invert)
+    {
+      wn = quick_mod(wn, p - 2, p); // 若为逆变换，则使用 wn 的逆元
+    }
+    long long wnR = mont.toMont(wn);
+    int half = len >> 1;
+    // 预先计算当前轮次用到的所有 w 值（蒙哥马利域表示）
+    vector<long long> wArr(half);
+    wArr[0] = mont.toMont(1);
+    for (int j = 1; j < half; ++j)
+    {
+      wArr[j] = mont.mulMont(wArr[j - 1], wnR);
+    }
+    if (half == 1)
+    {
+      // 长度为2的蝶形，仅1次运算，直接处理
+      for (int i = 0; i < n; i += len)
+      {
+        long long u = a[i];
+        long long v = mont.mulMont(wArr[0], a[i + half]);
+        a[i] = (u + v) % p;
+        a[i + half] = (u - v + p) % p;
       }
     }
-    // 按长度迭代合并 (蝶形变换)
-    for (int len = 2; len <= n; len <<= 1) {
-      int wn = quick_mod(root, (p - 1) / len, p);
-      if (invert) {
-        wn = quick_mod(wn, p - 2, p); // 若为逆变换，则使用 wn 的逆元
-      }
-      long long wnR = mont.toMont(wn);
-      int half = len >> 1;
-      // 预先计算当前轮次用到的所有 w 值（蒙哥马利域表示）
-      vector<long long> wArr(half);
-      wArr[0] = mont.toMont(1);
-      for (int j = 1; j < half; ++j) {
-        wArr[j] = mont.mulMont(wArr[j - 1], wnR);
-      }
-      if (half == 1) {
-        // 长度为2的蝶形，仅1次运算，直接处理
-        for (int i = 0; i < n; i += len) {
-          long long u = a[i];
-          long long v = mont.mulMont(wArr[0], a[i + half]);
-          a[i] = (u + v) % p;
-          a[i + half] = (u - v + p) % p;
+    else
+    {
+      // 使用 NEON SIMD 批量计算蝶形操作
+      vector<long long> a2temp(half);
+      vector<long long> vSegment(half);
+      int64x2_t vP = vdupq_n_s64(p);
+      for (int i = 0; i < n; i += len)
+      {
+        // 批量蒙哥马利乘法: 计算 wArr 与第二段 a 的点乘结果
+        for (int j = 0; j < half; ++j)
+        {
+          a2temp[j] = a[i + half + j];
         }
-      } else {
-        // 使用 NEON SIMD 批量计算蝶形操作
-        vector<long long> a2temp(half);
-        vector<long long> vSegment(half);
-        int64x2_t vP = vdupq_n_s64(p);
-        for (int i = 0; i < n; i += len) {
-          // 批量蒙哥马利乘法: 计算 wArr 与第二段 a 的点乘结果
-          for (int j = 0; j < half; ++j) {
-            a2temp[j] = a[i + half + j];
-          }
-          mont.mulMontVec(wArr, a2temp, vSegment);
-          // NEON 并行计算 (u+v) mod p 和 (u-v+p) mod p，并写回结果
-          for (int j = 0; j < half; j += 2) {
-            int64x2_t u_vec = vld1q_s64((const int64_t*)&a[i + j]);
-            int64x2_t v_vec = vld1q_s64((const int64_t*)&vSegment[j]);
-            int64x2_t sum = vaddq_s64(u_vec, v_vec);
-            int64x2_t diff = vsubq_s64(u_vec, v_vec);
-            diff = vaddq_s64(diff, vP);
-            uint64x2_t cmp_sum = vcgeq_s64(sum, vP);
-            uint64x2_t cmp_diff = vcgeq_s64(diff, vP);
-            int64x2_t sum_mod = vsubq_s64(sum, vP);
-            int64x2_t diff_mod = vsubq_s64(diff, vP);
-            sum = vbslq_s64(cmp_sum, sum_mod, sum);
-            diff = vbslq_s64(cmp_diff, diff_mod, diff);
-            vst1q_s64((int64_t*)&a[i + j], sum);
-            vst1q_s64((int64_t*)&a[i + half + j], diff);
-          }
+        mont.mulMontVec(wArr, a2temp, vSegment);
+        // NEON 并行计算 (u+v) mod p 和 (u-v+p) mod p，并写回结果
+        for (int j = 0; j < half; j += 2)
+        {
+          int64x2_t u_vec = vld1q_s64((const int64_t *)&a[i + j]);
+          int64x2_t v_vec = vld1q_s64((const int64_t *)&vSegment[j]);
+          int64x2_t sum = vaddq_s64(u_vec, v_vec);
+          int64x2_t diff = vsubq_s64(u_vec, v_vec);
+          diff = vaddq_s64(diff, vP);
+          uint64x2_t cmp_sum = vcgeq_s64(sum, vP);
+          uint64x2_t cmp_diff = vcgeq_s64(diff, vP);
+          int64x2_t sum_mod = vsubq_s64(sum, vP);
+          int64x2_t diff_mod = vsubq_s64(diff, vP);
+          sum = vbslq_s64(cmp_sum, sum_mod, sum);
+          diff = vbslq_s64(cmp_diff, diff_mod, diff);
+          vst1q_s64((int64_t *)&a[i + j], sum);
+          vst1q_s64((int64_t *)&a[i + half + j], diff);
         }
       }
     }
   }
-
+}
 
 // 逐点相乘（蒙哥马利域）并执行 NTT 计算卷积，返回蒙哥马利域下的结果
 vector<long long> get_result(vector<long long> &a, vector<long long> &b, int p, int root, const MontMul &mont)
