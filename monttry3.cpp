@@ -14,57 +14,119 @@ using namespace std;
 
 class MontMul
 {
-public:
-  MontMul(long long R, long long N)
+private:
+  uint64_t N;
+  uint64_t R;
+  int logR;
+  uint64_t N_inv_neg;
+  uint64_t R2;
+
+  struct EgcdResult
   {
-    this->N = N;
-    this->R = R;
-    this->logR = static_cast<int>(log2(R));
-    long long N_inv = modinv(N, R);
-    this->N_inv_neg = R - N_inv;
-    this->R2 = (R * R) % N;
+    int64_t g;
+    int64_t x;
+    int64_t y;
+  };
+
+  static EgcdResult egcd(uint64_t a, uint64_t b)
+  {
+    uint64_t old_r = a, r = b;
+    int64_t old_s = 1, s = 0;
+    int64_t old_t = 0, t = 1;
+    while (r != 0)
+    {
+      uint64_t quotient = old_r / r;
+      uint64_t temp = old_r;
+      old_r = r;
+      r = temp - quotient * r;
+
+      int64_t temp_s = old_s;
+      old_s = s;
+      s = temp_s - static_cast<int64_t>(quotient) * s;
+
+      int64_t temp_t = old_t;
+      old_t = t;
+      t = temp_t - static_cast<int64_t>(quotient) * t;
+    }
+    return {static_cast<int64_t>(old_r), old_s, old_t};
   }
 
-  static std::tuple<long long, long long, long long> egcd(long long a, long long b)
+  static uint64_t modinv(uint64_t a, uint64_t m)
   {
-    if (a == 0)
+    auto result = egcd(a, m);
+    if (result.g != 1)
     {
-      return std::make_tuple(b, 0, 1);
-    }
-    else
-    {
-      std::tuple<long long, long long, long long> result = egcd(b % a, a);
-      long long g = std::get<0>(result);
-      long long x = std::get<1>(result);
-      long long y = std::get<2>(result);
-      return std::make_tuple(g, y - (b / a) * x, x);
-    }
-  }
-
-  static long long modinv(long long a, long long m)
-  {
-    std::tuple<long long, long long, long long> result = egcd(a, m);
-    long long g = std::get<0>(result);
-    long long x = std::get<1>(result);
-    if (g != 1)
       throw std::runtime_error("modular inverse does not exist");
-    return (x % m + m) % m;
+    }
+    int64_t x = result.x % static_cast<int64_t>(m);
+    if (x < 0)
+    {
+      x += m;
+    }
+    return static_cast<uint64_t>(x);
   }
 
-  long long REDC(long long T) const
+public:
+  // 构造函数要求 R 为 2 的幂
+  MontMul(uint64_t R, uint64_t N) : R(R), N(N)
   {
-    long long m = ((T & ((1LL << logR) - 1)) * N_inv_neg) & ((1LL << logR) - 1);
-    long long t = (T + m * N) >> logR;
+    if (R == 0 || (R & (R - 1)) != 0)
+    {
+      throw std::invalid_argument("R must be a power of two");
+    }
+    logR = static_cast<int>(std::log2(R));
+    if ((1ULL << logR) != R)
+    {
+      throw std::invalid_argument("R is not a power of two");
+    }
+    uint64_t N_inv = modinv(N, R);
+    N_inv_neg = R - N_inv;
+    __int128 R_squared = static_cast<__int128>(R) * R;
+    R2 = static_cast<uint64_t>(R_squared % N);
+  }
+
+  // REDC 算法，将 __int128 类型的 T 转换为 Montgomery 域内元素
+  uint64_t REDC(__int128 T) const
+  {
+    uint64_t mask = (logR == 64) ? ~0ULL : ((1ULL << logR) - 1);
+    uint64_t m_part = static_cast<uint64_t>(T) & mask;
+    uint64_t m = (m_part * N_inv_neg) & mask;
+    __int128 mN = static_cast<__int128>(m) * N;
+    __int128 t_val = (T + mN) >> logR;
+    uint64_t t = static_cast<uint64_t>(t_val);
     return t >= N ? t - N : t;
   }
 
-  long long toMont(long long a) const { return REDC(a * R2); }
-  long long fromMont(long long aR) const { return REDC(aR); }
-  long long mulMont(long long aR, long long bR) const { return REDC(aR * bR); }
+  // 将普通整数转换到 Montgomery 域
+  uint64_t toMont(uint64_t a) const
+  {
+    return REDC(a * R2);
+  }
 
-private:
-  long long N, R, N_inv_neg, R2;
-  int logR;
+  // 从 Montgomery 域转换回普通整数
+  uint64_t fromMont(uint64_t aR) const
+  {
+    return REDC(aR);
+  }
+
+  // 在 Montgomery 域内进行乘法运算
+  uint64_t mulMont(uint64_t aR, uint64_t bR) const
+  {
+    return REDC(aR * bR);
+  }
+
+  // 保持原有接口：对于 a, b（要求均小于模 N），返回 a * b mod N
+  uint64_t ModMul(uint64_t a, uint64_t b)
+  {
+    if (a >= N || b >= N)
+    {
+      throw std::invalid_argument("input must be smaller than modulus N");
+    }
+    uint64_t aR = toMont(a);
+    uint64_t bR = toMont(b);
+    uint64_t abR = mulMont(aR, bR);
+    return fromMont(abR);
+  }
 };
 
 void fRead(int *a, int *b, int *n, int *p, int input_id)
