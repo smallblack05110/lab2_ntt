@@ -9,96 +9,95 @@
 #include <vector>
 #include <algorithm>
 #include <tuple>
-#include <arm_neon.h> // 使用 NEON 加速
+#include <arm_neon.h>
+#include <stdexcept>
+#include <cstdint>
+#include <omp.h>
 using namespace std;
-
-// 扩展欧几里得算法求解 a*x + b*y = gcd(a, b)，返回 (g, x, y)
-static std::tuple<long long, long long, long long> egcd(long long a, long long b)
-{
-  if (a == 0)
-    return std::make_tuple(b, 0LL, 1LL);
-  auto result = egcd(b % a, a);
-  long long g = std::get<0>(result);
-  long long x = std::get<1>(result);
-  long long y = std::get<2>(result);
-  // 更新 x, y 对应原始 a, b
-  return std::make_tuple(g, y - (b / a) * x, x);
-}
 
 class MontMul
 {
 public:
-  MontMul(long long R, long long N)
+  // 构造函数要求 R 为 2 的幂
+  MontMul(uint64_t R, uint64_t N) : R(R), N(N)
   {
-    this->N = N;
-    this->R = R;
-    this->logR = static_cast<int>(log2(R));
-    // 计算 N_inv，使得 N * N_inv ≡ 1 (mod R)
-    long long N_inv = std::get<1>(egcd(N, R));
-    if (N_inv < 0)
+    if (R == 0 || (R & (R - 1)) != 0)
     {
-      N_inv += R;
+      throw std::invalid_argument("R must be a power of two");
     }
-    this->N_inv_neg = R - N_inv;
-    // R2 = R * R mod N
-    long long R_modN = R % N;
-    this->R2 = (R_modN * R_modN) % N;
-  }
-
-  // 蒙哥马利约减：计算 (T + m * N) / R mod N，其中 m = (T * N_inv_neg) mod R
-  long long REDC(long long T) const
-  {
-    // mask = R - 1
-    long long mask = (logR == 64 ? -1LL : ((1LL << logR) - 1));
-    long long m = ((T & mask) * N_inv_neg) & mask;
-    long long t = (T + m * N) >> logR;
-    if (t >= N)
+    logR = static_cast<int>(std::log2(R));
+    if ((1ULL << logR) != R)
     {
-      t -= N;
+      throw std::invalid_argument("R is not a power of two");
     }
-    return t;
+    uint64_t N_inv = modinv(N, R);
+    N_inv_neg = R - N_inv;
+    __int128 R_squared = static_cast<__int128>(R) * R;
+    R2 = static_cast<uint64_t>(R_squared % N);
   }
 
-  // 转换到蒙哥马利表述（a -> a * R mod N）
-  long long toMont(long long a) const
+  // REDC 算法，将 __int128 类型的 T 转换为 Montgomery 域内元素
+  uint64_t REDC(__int128 T) const
   {
-    // 乘以 R^2 后简化，得到 a 的蒙哥马利表示
-    long long T = (long long)((__int128)a * R2 % N);
-    return REDC(T);
+    uint64_t mask = (logR == 64) ? ~0ULL : ((1ULL << logR) - 1);
+    uint64_t m_part = static_cast<uint64_t>(T) & mask;
+    uint64_t m = (m_part * N_inv_neg) & mask;
+    __int128 mN = static_cast<__int128>(m) * N;
+    __int128 t_val = (T + mN) >> logR;
+    uint64_t t = static_cast<uint64_t>(t_val);
+    return t >= N ? t - N : t;
   }
 
-  // 从蒙哥马利表示还原普通值
-  long long fromMont(long long aR) const
+  // 将普通整数转换到 Montgomery 域
+  uint64_t toMont(uint64_t a) const
+  {
+    return REDC(static_cast<__int128>(a) * R2);
+  }
+
+  // 从 Montgomery 域转换回普通整数
+  uint64_t fromMont(uint64_t aR) const
   {
     return REDC(aR);
   }
 
-  // 蒙哥马利模乘：相乘两个蒙哥马利表示数
-  long long mulMont(long long aR, long long bR) const
+  // 在 Montgomery 域内进行乘法运算
+  uint64_t mulMont(uint64_t aR, uint64_t bR) const
   {
-    long long T = (long long)((__int128)aR * bR);
-    return REDC(T);
+    return REDC(static_cast<__int128>(aR) * bR);
   }
 
-  // 批量转换 vector 到蒙哥马利域
+  // 保持原有接口：对于 a, b（要求均小于模 N），返回 a * b mod N
+  uint64_t ModMul(uint64_t a, uint64_t b)
+  {
+    if (a >= N || b >= N)
+    {
+      throw std::invalid_argument("input must be smaller than modulus N");
+    }
+    uint64_t aR = toMont(a);
+    uint64_t bR = toMont(b);
+    uint64_t abR = mulMont(aR, bR);
+    return fromMont(abR);
+  }
+
+  // 批量将 vector 中的元素转换到 Montgomery 域
   void toMontVec(vector<long long> &inout) const
   {
 #pragma omp parallel for
-    for (int i = 0; i < (int)inout.size(); ++i)
+    for (size_t i = 0; i < inout.size(); ++i)
     {
-      __int128 prod = (__int128)inout[i] * R2;
-      long long T = (long long)(prod % N);
-      inout[i] = REDC(T);
+      uint64_t val = static_cast<uint64_t>(inout[i]);
+      inout[i] = static_cast<long long>(toMont(val));
     }
   }
 
-  // 批量从蒙哥马利域转换 vector
+  // 批量将 Montgomery 域内的元素转换回普通整数
   void fromMontVec(vector<long long> &inout) const
   {
 #pragma omp parallel for
-    for (int i = 0; i < (int)inout.size(); ++i)
+    for (size_t i = 0; i < inout.size(); ++i)
     {
-      inout[i] = REDC(inout[i]);
+      uint64_t val = static_cast<uint64_t>(inout[i]);
+      inout[i] = static_cast<long long>(fromMont(val));
     }
   }
 
@@ -151,11 +150,57 @@ public:
   }
 
 private:
-  long long N;
-  long long R;
-  long long N_inv_neg;
-  long long R2;
+  uint64_t N;
+  uint64_t R;
   int logR;
+  uint64_t N_inv_neg;
+  uint64_t R2;
+
+  struct EgcdResult
+  {
+    int64_t g;
+    int64_t x;
+    int64_t y;
+  };
+
+  // 扩展欧几里得算法（适用于无符号数，但 x, y 为带符号类型）
+  static EgcdResult egcd(uint64_t a, uint64_t b)
+  {
+    uint64_t old_r = a, r = b;
+    int64_t old_s = 1, s = 0;
+    int64_t old_t = 0, t = 1;
+    while (r != 0)
+    {
+      uint64_t quotient = old_r / r;
+      uint64_t temp = old_r;
+      old_r = r;
+      r = temp - quotient * r;
+
+      int64_t temp_s = old_s;
+      old_s = s;
+      s = temp_s - static_cast<int64_t>(quotient) * s;
+
+      int64_t temp_t = old_t;
+      old_t = t;
+      t = temp_t - static_cast<int64_t>(quotient) * t;
+    }
+    return {static_cast<int64_t>(old_r), old_s, old_t};
+  }
+
+  static uint64_t modinv(uint64_t a, uint64_t m)
+  {
+    auto result = egcd(a, m);
+    if (result.g != 1)
+    {
+      throw std::runtime_error("modular inverse does not exist");
+    }
+    int64_t x = result.x % static_cast<int64_t>(m);
+    if (x < 0)
+    {
+      x += m;
+    }
+    return static_cast<uint64_t>(x);
+  }
 };
 
 // 快速幂取模
@@ -174,6 +219,39 @@ int quick_mod(int a, int b, int p)
   }
   return (int)result;
 }
+
+// void ntt_recur(vector<int> &a, int p, int root, bool invert, MontMul &mont)
+// { // ntt递归实现
+//   int n = a.size();
+//   if (n == 1) // 等于一时直接返回
+//     return;
+
+//   int half = n / 2;
+//   vector<int> a_e(half), a_o(half);
+//   for (int i = 0; i < half; ++i)
+//   {
+//     a_e[i] = a[2 * i];     // 偶数项
+//     a_o[i] = a[2 * i + 1]; // 奇数项
+//   }
+//   ntt_recur(a_e, p, root, invert, mont);
+//   ntt_recur(a_o, p, root, invert, mont);
+
+//   int wn = quick_mod(root, (p - 1) / n, p);
+//   if (invert)
+//   {
+//     wn = quick_mod(wn, p - 2, p); // 如果是反变换，wn要取模p-2（费马小定理）
+//   }
+
+//   int w0 = 1;
+//   for (int i = 0; i < half; ++i)
+//   {
+//     int op1 = a_e[i];
+//     int op2 = mont.ModMul(w0, a_o[i]); // 使用蒙哥马利模乘
+//     a[i] = (op1 + op2) % p;
+//     a[i + half] = (op1 - op2 + p) % p;
+//     w0 = mont.ModMul(w0, wn); // 使用蒙哥马利模乘
+//   }
+// }
 
 // 迭代实现 NTT (Number Theoretic Transform)
 void ntt_iter(vector<long long> &a, int p, int root, bool invert, const MontMul &mont)
@@ -321,7 +399,7 @@ void fWrite(int *ab, int n, int input_id)
 int a[300000], b[300000], ab[300000];
 int main(int argc, char *argv[])
 {
-  int test_begin = 0, test_end = 1;
+  int test_begin = 0, test_end = 3;
   for (int id = test_begin; id <= test_end; ++id)
   {
     long double ans = 0.0;
@@ -341,7 +419,7 @@ int main(int argc, char *argv[])
 
     // 拷贝到 vector<long long>，用于 NTT（蒙哥马利域运算）
     vector<long long> va(a, a + len), vb(b, b + len);
-    long long R = 1LL << 30;
+    uint64_t R = 1ULL << 30;
     MontMul mont(R, p_);
 
     // 将系数转换到蒙哥马利域
